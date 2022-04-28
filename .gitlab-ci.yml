@@ -1,0 +1,167 @@
+image: docker:latest
+
+cache:
+  paths:
+    - .m2/repository
+
+variables:
+  MAVEN_OPTS: "-Dmaven.repo.local=$CI_PROJECT_DIR/.m2/repository"
+
+stages:
+  - compile check
+  - build Docker image
+  - deploy to on-prem Dev
+  - deploy to on-prem Staging
+  - deploy to on-prem Production
+
+compile check:
+  tags:
+    - COMPILE
+  stage: compile check
+  image: maven:3.6-openjdk-11
+  artifacts:
+    paths:
+      - target/*.jar
+  script:
+    - mvn $MAVEN_CLI_OPTS clean package
+  except:
+    - schedules
+    - tags
+  interruptible: true
+
+build Docker image:
+  stage: build Docker image
+  tags:
+    - DOCKERBUILD
+  script:
+    - build
+  only:
+    - /^dev$/
+    - /^staging$/
+    - /^release.*$/
+  except:
+    - schedules
+    - tags
+  interruptible: true
+
+deploy to on-prem Dev:
+  stage: deploy to on-prem Dev
+  tags:
+    - DEV
+  image: gcr.io/google.com/cloudsdktool/cloud-sdk:latest
+  script:
+    - cat manifests/config/kubeconfig-dev > ${HOME}/config
+    - export KUBECONFIG=${HOME}/config
+    - kubectl config set-context --current --namespace=$K8S_DEPLOYMENT_NAMESPACE_SIT
+    - kubectl get nodes
+    - sed -i "s/<TAGS>/$CI_COMMIT_SHA/g" manifests/deploy/deployment.yaml
+    - sed -i "s/<CI_APPLICATION_REPOSITORY>/$CI_APPLICATION_REPOSITORY/g" manifests/deploy/deployment.yaml
+    - sed -i "s/<CI_REGISTRY>/$CI_REGISTRY/g" manifests/deploy/deployment.yaml
+    - sed -i "s/<PROJECT_ID>/$(echo $PROJECT_ID_GITLAB | sed 's/\//\\\//g')/g" manifests/deploy/deployment.yaml
+    - cat manifests/deploy/deployment.yaml
+    - kubectl apply -f manifests/deploy/deployment.yaml -n $K8S_DEPLOYMENT_NAMESPACE_SIT
+    - kubectl rollout status deploy $K8S_DEPLOYMENT_NAME -n $K8S_DEPLOYMENT_NAMESPACE_SIT
+  only:
+    - /^dev$/
+  interruptible: true
+
+deploy to on-prem Staging:
+  stage: deploy to on-prem Staging
+  tags:
+    - STAGING
+  image: gcr.io/google.com/cloudsdktool/cloud-sdk:latest
+  script:
+    - cat manifests/config/kubeconfig-staging > ${HOME}/config
+    - export KUBECONFIG=${HOME}/config
+    - kubectl config set-context --current --namespace=$K8S_DEPLOYMENT_NAMESPACE_STAGING
+    - kubectl get nodes
+    - sed -i "s/<TAGS>/$CI_COMMIT_SHA/g" manifests/deploy/deployment.yaml
+    - sed -i "s/<CI_APPLICATION_REPOSITORY>/$CI_APPLICATION_REPOSITORY/g" manifests/deploy/deployment.yaml
+    - sed -i "s/<CI_REGISTRY>/$CI_REGISTRY/g" manifests/deploy/deployment.yaml
+    - sed -i "s/<PROJECT_ID>/$(echo $PROJECT_ID_GITLAB | sed 's/\//\\\//g')/g" manifests/deploy/deployment.yaml
+    - cat manifests/deploy/deployment.yaml
+    - kubectl apply -f manifests/deploy/deployment.yaml
+    - kubectl rollout status deploy $K8S_DEPLOYMENT_NAME
+  only:
+    - /^staging$/
+  interruptible: true
+
+deploy to on-prem Production:
+  stage: deploy to on-prem Production
+  tags:
+    - PRODUCTION
+  image: gcr.io/google.com/cloudsdktool/cloud-sdk:latest
+  script:
+    - cat manifests/config/kubeconfig-prod > ${HOME}/config
+    - export KUBECONFIG=${HOME}/config
+    - kubectl config set-context --current --namespace=$K8S_DEPLOYMENT_NAMESPACE_PROD
+    - kubectl get nodes
+    - cp /home/manifests/$K8S_DEPLOYMENT_NAME/deployment.yaml manifests/deploy/deployment.yaml
+    - sed -i "s/<TAGS>/$(echo $CI_COMMIT_REF_NAME | cut -d'/' -f2)/g" manifests/deploy/deployment.yaml
+    - sed -i "s/<CI_APPLICATION_REPOSITORY>/$CI_APPLICATION_REPOSITORY/g" manifests/deploy/deployment.yaml
+    - sed -i "s/<CI_REGISTRY>/$CI_REGISTRY/g" manifests/deploy/deployment.yaml
+    - sed -i "s/<PROJECT_ID>/$(echo $PROJECT_ID_GITLAB | sed 's/\//\\\//g')/g" manifests/deploy/deployment.yaml
+    - cat manifests/deploy/deployment.yaml
+    - kubectl apply -f manifests/deploy/deployment.yaml
+    - kubectl rollout status deploy $K8S_DEPLOYMENT_NAME
+  only:
+    - schedules
+  interruptible: true
+
+.auto_devops: &auto_devops |
+  # Auto DevOps variables and functions
+  [[ "$TRACE" ]] && set -x
+
+  function setup_docker() {
+    if ! docker info &>/dev/null; then
+      if [ -z "$DOCKER_HOST" ]; then
+        export DOCKER_HOST='tcp://localhost:2375'
+      fi
+    fi
+  }
+
+  function build() {
+    docker login -u "$CI_CONTAINER_REG_ACCOUNT" -p "$CI_CONTAINER_REG_PASSWORD" "$CI_REGISTRY"
+    if [[ -f Dockerfile ]]; then
+      echo "Building Dockerfile-based application..."
+      if [[ "$(echo $CI_COMMIT_REF_NAME | cut -d'/' -f1)" = "release" ]];then
+        docker build -t "$CI_REGISTRY/$PROJECT_ID_GITLAB/$CI_APPLICATION_REPOSITORY:$(echo $CI_COMMIT_REF_NAME | cut -d'/' -f2)" .
+      else
+        docker build -t "$CI_REGISTRY/$PROJECT_ID_GITLAB/$CI_APPLICATION_REPOSITORY:$CI_COMMIT_SHA" .
+      fi
+    fi
+    if [[ "$(echo $CI_COMMIT_REF_NAME | cut -d'/' -f1)" = "release" ]];then
+        docker push "$CI_REGISTRY/$PROJECT_ID_GITLAB/$CI_APPLICATION_REPOSITORY:$(echo $CI_COMMIT_REF_NAME | cut -d'/' -f2)"
+    else
+        docker push "$CI_REGISTRY/$PROJECT_ID_GITLAB/$CI_APPLICATION_REPOSITORY:$CI_COMMIT_SHA"
+    fi
+    echo ""
+  }
+
+  function buildGCPImage() {
+    echo "buildGCPImage start..."
+    if [[ "$(echo $CI_COMMIT_REF_NAME | cut -d'/' -f1)" = "release" ]];then
+      echo $SERVICE_KEY_GCP_PROD | base64 -d > ${HOME}/gcloud-service-key.json
+    else
+      echo $SERVICE_KEY_GCP_NONPROD | base64 -d > ${HOME}/gcloud-service-key.json
+    fi
+    docker login -u _json_key -p "$(cat ${HOME}/gcloud-service-key.json)" "$CI_REGISTRY_GCP"
+    echo "buildGCPImage login GCP..."
+    if [[ -f Dockerfile ]]; then
+      echo "Building Dockerfile-based application..."
+      if [[ "$(echo $CI_COMMIT_REF_NAME | cut -d'/' -f1)" = "release" ]];then
+        docker build -t "$CI_REGISTRY_GCP/$PROJECT_ID_GCP_PROD/$CI_APPLICATION_REPOSITORY:$(echo $CI_COMMIT_REF_NAME | cut -d'/' -f2)" .
+      else
+        docker build -t "$CI_REGISTRY_GCP/$PROJECT_ID_GCP_NONPROD/$CI_APPLICATION_REPOSITORY:$CI_COMMIT_SHA" .
+      fi
+    fi
+    if [[ "$(echo $CI_COMMIT_REF_NAME | cut -d'/' -f1)" = "release" ]];then
+        docker push "$CI_REGISTRY_GCP/$PROJECT_ID_GCP_PROD/$CI_APPLICATION_REPOSITORY:$(echo $CI_COMMIT_REF_NAME | cut -d'/' -f2)"
+    else
+        docker push "$CI_REGISTRY_GCP/$PROJECT_ID_GCP_NONPROD/$CI_APPLICATION_REPOSITORY:$CI_COMMIT_SHA"
+    fi
+    echo ""
+  }
+
+before_script:
+  - *auto_devops

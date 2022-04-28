@@ -1,0 +1,89 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: mms
+  name: mms-oapi
+  labels:
+    app: mms-oapi
+spec:
+  selector:
+    matchLabels:
+      app: mms-oapi
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: mms-oapi
+    spec:
+      containers:
+        - name: mms-oapi
+          image: <CI_REGISTRY>/<PROJECT_ID>/<CI_APPLICATION_REPOSITORY>:<TAGS>
+          resources:
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+            requests:
+              cpu: "0.5"
+              memory: "512Mi"
+          ports:
+            - containerPort: 8080
+          env:
+            - name: JAVA_OPTS
+              valueFrom:
+                secretKeyRef:
+                  name: mms-oapi-secret
+                  key: java_opts
+            - name: ACTIVE
+              value: "remote"
+            - name: MMS_DB_URL
+              valueFrom:
+                secretKeyRef:
+                  name: mms-oapi-secret
+                  key: mms_db_url
+            - name: MMS_DB_ACCOUNT
+              valueFrom:
+                secretKeyRef:
+                  name: mms-oapi-secret
+                  key: mms_db_account
+            - name: MMS_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mms-oapi-secret
+                  key: mms_db_password
+            - name: MMS_REDIS_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: mms-oapi-secret
+                  key: mms_redis_host
+            - name: MMS_REDIS_PORT
+              valueFrom:
+                secretKeyRef:
+                  name: mms-oapi-secret
+                  key: mms_redis_port
+            - name: MMS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: mms-oapi-secret
+                  key: mms_url
+          livenessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8080
+            initialDelaySeconds: 180
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+            successThreshold: 1
+          readinessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /actuator/health
+              port: 8080
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            successThreshold: 1
+            timeoutSeconds: 3
